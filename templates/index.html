@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P2P Video Chat</title>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <style>
+        body {
+            font-family: sans-serif;
+            background-color: #f0f0f0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+        }
+        .container {
+            background-color: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            width: 90%;
+            max-width: 600px;
+            text-align: center;
+        }
+        #videos {
+            display: flex;
+            justify-content: space-around;
+            margin-top: 20px;
+            flex-wrap: wrap;
+        }
+        video {
+            width: 280px;
+            height: 210px;
+            object-fit: cover;
+            border: 2px solid #ddd;
+            border-radius: 4px;
+            margin: 10px;
+        }
+        #roomNameInput {
+            width: 80%;
+            padding: 10px;
+            margin-bottom: 10px;
+            border-radius: 4px;
+            border: 1px solid #ddd;
+        }
+
+        .flash-message {
+            padding: 10px;
+            margin-bottom: 15px;
+            border-radius: 4px;
+        }
+
+        .flash-error {
+            background-color: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>P2P Video Chat</h1>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+    {% for category, message in messages %}
+    <div class="flash-message flash-{{ category }}">
+        {{ message }}
+    </div>
+    {% endfor %}
+    {% endif %}
+    {% endwith %}
+
+    <div id="roomSelection">
+        <input type="text" id="roomNameInput" placeholder="Enter room name">
+        <button id="joinRoomBtn" class="btn btn-primary">Join/Create Room</button>
+    </div>
+
+    <div id="videos" style="display: none;">
+        <video id="localVideo" autoplay muted></video>
+        <video id="remoteVideo" autoplay></video>
+    </div>
+    <p id="status"></p>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.1.3/socket.io.js"></script>
+<script>
+    const socket = io();
+    let localStream;
+    let peerConnection;
+    let roomName;
+    const localVideo = document.getElementById('localVideo');
+    const remoteVideo = document.getElementById('remoteVideo');
+    const joinRoomBtn = document.getElementById('joinRoomBtn');
+    const roomSelection = document.getElementById('roomSelection');
+    const videosDiv = document.getElementById('videos');
+    const statusDisplay = document.getElementById('status');
+
+
+    const iceServers = {  //  STUN/TURN servers (replace with your TURN server if needed)
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+      ],
+    };
+
+    // Get user media (camera and microphone)
+    async function getMedia() {
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        localVideo.srcObject = localStream;
+        return true; // Indicate success
+      } catch (error) {
+        console.error('Error accessing media devices:', error);
+        socket.emit('error_media', { message: 'Camera and microphone are required.  Please grant permission or check your devices.'});
+        return false; // Indicate failure
+      }
+    }
+
+    // --- Room Joining Logic ---
+    joinRoomBtn.addEventListener('click', async () => {
+          const enteredRoomName = document.getElementById('roomNameInput').value;
+
+          const response = await fetch('/room', {
+              method: 'POST',
+              headers: {
+                  'Content-Type': 'application/x-www-form-urlencoded',
+              },
+              body: `roomName=${encodeURIComponent(enteredRoomName)}`,
+          });
+
+          const data = await response.json();
+
+          if (data.status === 'full') {
+              alert(data.message);
+          } else if (data.status === 'create' || data.status === 'join') {
+              roomName = data.roomName;
+              if (await getMedia()) { // Only proceed if media is obtained
+                roomSelection.style.display = 'none';
+                videosDiv.style.display = 'flex';
+                socket.emit('join', { roomName });
+            }
+          }
+      });
+
+
+      // --- Socket.IO Event Handlers ---
+      socket.on('joined', (data) => {
+        console.log('Successfully joined room:', data.room, 'SID:', data.sid);
+        statusDisplay.textContent = `Connected to room: ${data.room}`;
+        if (data.num_participants > 1){
+          createPeerConnection();
+          sendOffer();  //Initiate the connection if the room is not empty.
+        }
+      });
+
+    socket.on('new_user', async (data) => {
+        console.log('New user connected:', data.sid);
+        if (!peerConnection) {
+            createPeerConnection();
+        }
+        // Don't send offer, wait for it.
+    });
+
+
+    socket.on('offer', async (data) => {
+      if (!peerConnection) {
+        createPeerConnection();
+      }
+      console.log('Received offer from:', data.senderSid);
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
+      sendAnswer(data.senderSid);
+    });
+
+    socket.on('answer', async (data) => {
+      console.log('Received answer from:', data.senderSid);
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+    });
+
+    socket.on('ice_candidate', async (data) => {
+      console.log('Received ICE candidate from:', data.senderSid);
+      if (data.candidate) {  //  null candidate indicates the end of the candidate gathering.
+         await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+      }
+
+    });
+
+
+    socket.on('user_disconnected', (data) => {
+      console.log('User disconnected:', data.sid);
+      remoteVideo.srcObject = null; // Clear the remote video
+      if (peerConnection) {
+         peerConnection.close(); //Close the connection.
+         peerConnection = null;
+      }
+    });
+
+    socket.on('media_error', (data) => {
+      alert(data.message)
+    });
+    // --- WebRTC Functions ---
+
+    function createPeerConnection() {
+        peerConnection = new RTCPeerConnection(iceServers);
+
+        // Add local stream tracks to the peer connection
+         localStream.getTracks().forEach(track => {
+            peerConnection.addTrack(track, localStream);
+        });
+
+
+        // Handle incoming tracks (remote stream)
+        peerConnection.ontrack = event => {
+          if (remoteVideo.srcObject !== event.streams[0]) {
+             remoteVideo.srcObject = event.streams[0];
+          }
+        };
+
+
+      // Handle ICE candidates
+      peerConnection.onicecandidate = event => {
+        if (event.candidate) {
+          socket.emit('ice_candidate', { recipientSid: getOtherParticipantSid(), candidate: event.candidate });
+        }
+      };
+
+       peerConnection.oniceconnectionstatechange = () => {
+            console.log('ICE connection state:', peerConnection.iceConnectionState);
+             if (peerConnection.iceConnectionState === 'failed') {
+                 //Handle failed connection, e.g., attempt to restart ICE
+              }
+        };
+        peerConnection.onsignalingstatechange = (event) => {
+            console.log('Signaling state changed:', peerConnection.signalingState);
+        };
+
+
+    }
+
+      async function sendOffer() {
+        const offer = await peerConnection.createOffer();
+        await peerConnection.setLocalDescription(offer);
+        socket.emit('offer', { recipientSid: getOtherParticipantSid(), offer: offer });
+      }
+
+
+      async function sendAnswer(recipientSid) {
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+        socket.emit('answer', { recipientSid: recipientSid, answer: answer });
+      }
+
+    function getOtherParticipantSid() {
+      //This is very basic, and will only work for a two-person chat.
+      // In a production environment you should keep a map of connected users.
+      for (let sid in io.sockets.adapter.rooms[roomName].sockets){
+        if (sid != socket.id) return sid;
+      }
+    }
+</script>
+</body>
+</html>
